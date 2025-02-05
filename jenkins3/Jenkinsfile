@@ -1,0 +1,96 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_REGISTRY = "abhishekf5"
+        IMAGE_NAME = "cicd-e2e"
+        IMAGE_TAG = "${BUILD_NUMBER}"
+        K8S_MANIFEST_REPO = "https://github.com/iam-veeramalla/cicd-demo-manifests-repo.git"
+        APP_REPO = "https://github.com/iam-veeramalla/cicd-end-to-end"
+        BRANCH = "main"
+        CREDENTIALS_ID = "f87a34a8-0e09-45e7-b9cf-6dc68feac670"
+        KUBE_CONFIG = "kubeconfig"  // Jenkins credential ID for Kubernetes config
+        K8S_NAMESPACE = "default"   // Change namespace if needed
+    }
+
+    stages {
+
+        stage('Checkout Source Code') {
+            steps {
+                git credentialsId: "${CREDENTIALS_ID}", url: "${APP_REPO}", branch: "${BRANCH}"
+            }
+        }
+
+        stage('Run Jest Tests') {
+            steps {
+                script {
+                    sh """
+                    echo 'Running Jest Tests...'
+                    npm install
+                    npm test -- --coverage --ci --reporters=jest-junit
+                    """
+                }
+            }
+        }
+
+        stage('Build & Push Docker Image') {
+            steps {
+                script {
+                    sh """
+                    echo 'Building Docker Image'
+                    docker build -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG} .
+                    echo 'Pushing Docker Image'
+                    docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        stage('Checkout Kubernetes Manifests') {
+            steps {
+                git credentialsId: "${CREDENTIALS_ID}", url: "${K8S_MANIFEST_REPO}", branch: "${BRANCH}"
+            }
+        }
+
+        stage('Update Kubernetes Manifest & Push') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: "${CREDENTIALS_ID}", passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
+                        sh """
+                        echo 'Updating Kubernetes deployment manifest'
+                        sed -i 's|image: ${DOCKER_REGISTRY}/${IMAGE_NAME}:.*|image: ${DOCKER_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}|' deploy.yaml
+                        echo 'Committing and pushing changes'
+                        git add deploy.yaml
+                        git commit -m 'Updated deploy.yaml with image tag ${IMAGE_TAG} | Jenkins Pipeline'
+                        git push https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/iam-veeramalla/cicd-demo-manifests-repo.git HEAD:${BRANCH}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                script {
+                    withCredentials([file(credentialsId: "${KUBE_CONFIG}", variable: 'KUBECONFIG')]) {
+                        sh """
+                        echo 'Applying new deployment to Kubernetes...'
+                        kubectl apply -f deploy.yaml --namespace=${K8S_NAMESPACE}
+                        kubectl rollout status deployment/cicd-app --namespace=${K8S_NAMESPACE}
+                        echo 'Deployment successful!'
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline completed successfully!'
+        }
+        failure {
+            echo 'Pipeline failed!'
+        }
+    }
+}
